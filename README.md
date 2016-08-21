@@ -1,5 +1,5 @@
-# BrainFuck Just-In-Time Compiler
-Usage: jit.exe <filename>
+# Brainfuck Just-In-Time Compiler
+Usage: `jit.exe <filename>`
 
 ## Notes
-Compiles BrainFuck code into x86 assembly on Windows
+Performs just in time compilation of brainfuck for x86 processors running Windows

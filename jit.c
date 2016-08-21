@@ -1,268 +1,154 @@
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-#include <conio.h>
-#include <stdint.h>
 #include <Windows.h>
 
-struct bf_compiler {
-	uint32_t offset_addr;
-	uint32_t mem_addr;
-	uint32_t putchar_addr;
-	uint32_t getchar_addr;
+#include <conio.h>
+#include <stdio.h>
+
+#define halt() __asm { int 3 }
+
+#define BFx86_push_ebp (LPBYTE)"\x55"
+#define BFx86_mov_ebp_esp (LPBYTE)"\x8b\xec"
+#define BFx86_push_ecx (LPBYTE)"\x51"
+#define BFx86_mov_ax_dsParam (LPBYTE)"\x66\xa1"
+#define BFx86_mov_dsParam_ax (LPBYTE)"\x66\xa3"
+#define BFx86_inc_ax (LPBYTE)"\x66\x40"
+#define BFx86_dec_ax (LPBYTE)"\x66\x48"
+#define BFx86_add_ax_param (LPBYTE)"\x66\x05"
+#define BFx86_sub_ax_param (LPBYTE)"\x66\x2d"
+#define BFx86_movzx_ecx_wordPtrDsParam (LPBYTE)"\x0f\xb7\x0d"
+#define BFx86_mov_dl_bytePtrEcxParam (LPBYTE)"\x8a\x91"
+#define BFx86_mov_bytePtrEcxParam_dl (LPBYTE)"\x88\x91"
+#define BFx86_inc_dl (LPBYTE)"\xfe\xc2"
+#define BFx86_dec_dl (LPBYTE)"\xfe\xca"
+#define BFx86_add_dl_param (LPBYTE)"\x80\xc2"
+#define BFx86_sub_dl_param (LPBYTE)"\x80\xea"
+#define BFx86_movsx_eax_bytePtrEcxParam (LPBYTE)"\x0f\xbe\x81"
+#define BFx86_push_eax (LPBYTE)"\x50"
+#define BFx86_call (LPBYTE)"\xe8"
+#define BFx86_add_esp_4 (LPBYTE)"\x83\xc4\x04"
+#define BFx86_mov_bytePtrEcxParam_al (LPBYTE)"\x88\x81"
+#define BFx86_movzx_eax_bytePtrEcxParam (LPBYTE)"\x0f\xb6\x81"
+#define BFx86_test_eax_eax (LPBYTE)"\x85\xc0"
+#define BFx86_je (LPBYTE)"\x0f\x84"
+#define BFx86_xor_eax_eax (LPBYTE)"\x33\xc0"
+#define BFx86_mov_esp_ebp (LPBYTE)"\x8b\xe5"
+#define BFx86_pop_ebp (LPBYTE)"\x5d"
+#define BFx86_ret (LPBYTE)"\xc3"
+#define BFx86_jmp (LPBYTE)"\xe9"
+#define BFx86_int_3 (LPBYTE)"\xcc"
+
+#define CHUNK_SIZE 4096
+
+typedef void(*bf_void_program)();
+
+struct bf_compiler_opts {
+	UINT32 mem_addr;
+	UINT32 offset_addr;
+	UINT32 putchar_addr;
+	UINT32 getchar_addr;
 	BOOL optimization;
 };
 
-#define WRITE(x) do { if (buffer != NULL && length < max_length - 1) { *(buffer++) = (x); } ++length; } while (0)
+enum bf_type {
+	BF_NONE,
+	BF_UINT8,
+	BF_UINT16,
+	BF_UINT32,
+	BF_ADDR,
+	BF_ADDR_REL
+};
 
-#define WRITE_WORD(x) do {\
-	if (buffer != NULL && length < max_length - 3) {\
-		*(buffer++) = (x) & 0xff;\
-		*(buffer++) = ((x) >> 8) & 0xff;\
-	}\
-	\
-	length += 2;\
-} while (0)
+DWORD bf_opcode_len(LPBYTE opcode) {
+	DWORD ctr = 0;
 
-#define WRITE_DWORD(x) do {\
-	if (buffer != NULL && length < max_length - 5) {\
-		*(buffer++) = (x) & 0xff;\
-		*(buffer++) = ((x) >> 8) & 0xff;\
-		*(buffer++) = ((x) >> 16) & 0xff;\
-		*(buffer++) = ((x) >> 24) & 0xff;\
-	}\
-	\
-	length += 4;\
-} while (0)
+	while (*(opcode++) != '\0') {
+		ctr++;
+	}
 
-#define WRITE_ADDR WRITE_DWORD
+	return ctr;
+}
 
-	// mov ds:offset_addr, ax
-#define MOV_DSOFFSETADDR_AX() do {\
-	WRITE(0x66);\
-	WRITE(0xa3);\
-	\
-	WRITE_ADDR(offset_addr);\
-} while (0)
+VOID bf_write(LPBYTE program, DWORD program_max_size, LPDWORD program_len, LPBYTE opcode, enum bf_type param_type, LPVOID param) {
+	DWORD opcode_len = bf_opcode_len(opcode);
+	DWORD param_size = 0;
 
-// mov ax, ds:offset_addr
-#define MOV_AX_DSOFFSETADDR() do {\
-	WRITE(0x66);\
-	WRITE(0xa1);\
-	\
-	WRITE_ADDR(offset_addr);\
-} while (0)
+	if (param_type == BF_UINT8) {
+		param_size = 1;
+	} else if (param_type == BF_UINT16) {
+		param_size = 2;
+	} else if (param_type == BF_UINT32 || param_type == BF_ADDR || param_type == BF_ADDR_REL) {
+		param_size = 4;
+	}
 
-// inc ax
-#define INC_AX() do {\
-	WRITE(0x66);\
-	WRITE(0x40);\
-} while(0)
+	if (*program_len + opcode_len + param_size > program_max_size) {
+		*program_len += opcode_len + param_size;
 
-// dec ax
-#define DEC_AX() do {\
-	WRITE(0x66);\
-	WRITE(0x48);\
-} while (0)
+		return;
+	}
 
-// add ax, n
-#define ADD_AX(n) do {\
-	WRITE(0x66);\
-	WRITE(0x05);\
-	\
-	WRITE_WORD(n);\
-} while (0)
+	if (program != NULL) {
+		for (DWORD i = 0; i < opcode_len; i++) {
+			program[(*program_len)++] = opcode[i];
+		}
+	} else {
+		*program_len += opcode_len;
+	}
 
-// sub ax, n
-#define SUB_AX(n) do {\
-	WRITE(0x66);\
-	WRITE(0x2d);\
-	\
-	WRITE_WORD(n);\
-} while (0)
+	if (param_type == BF_UINT8) {
+		if (program != NULL) {
+			program[(*program_len)++] = (UINT8)((UINT8)param & 0xff);
+		} else {
+			*program_len += sizeof(UINT8);
+		}
+	} else if (param_type == BF_UINT16) {
+		if (program != NULL) {
+			program[(*program_len)++] = (UINT8)((UINT16)param & 0xff);
+			program[(*program_len)++] = (UINT8)(((UINT16)param >> 8) & 0xff);
+		} else {
+			*program_len += sizeof(UINT16);
+		}
+	} else if (param_type == BF_UINT32 || param_type == BF_ADDR) {
+		if (program != NULL) {
+			program[(*program_len)++] = (UINT8)((UINT32)param & 0xff);
+			program[(*program_len)++] = (UINT8)(((UINT32)param >>  8) & 0xff);
+			program[(*program_len)++] = (UINT8)(((UINT32)param >> 16) & 0xff);
+			program[(*program_len)++] = (UINT8)(((UINT32)param >> 24) & 0xff);
+		} else {
+			*program_len += sizeof(UINT32);
+		}
+	} else if (param_type == BF_ADDR_REL) {
+		if (program != NULL) {
+			UINT32 param_rel = (UINT32)param - (UINT32)(program + *program_len) - 4;
 
-// movzx ecx, WORD PTR ds:offset_addr
-#define MOVZX_ECX_WORDPTRDSOFFSETADDR() do {\
-	WRITE(0x0f);\
-	WRITE(0xb7);\
-	WRITE(0x0d);\
-	\
-	WRITE_ADDR(offset_addr);\
-} while (0)
+			program[(*program_len)++] = (UINT8)(param_rel & 0xff);
+			program[(*program_len)++] = (UINT8)((param_rel >>  8) & 0xff);
+			program[(*program_len)++] = (UINT8)((param_rel >> 16) & 0xff);
+			program[(*program_len)++] = (UINT8)((param_rel >> 24) & 0xff);
+		} else {
+			*program_len += sizeof(UINT32);
+		}
+	}
+}
 
-#define MOV_DL_BYTEPTRECXMEMADDR() do {\
-	WRITE(0x8a);\
-	WRITE(0x91);\
-	\
-	WRITE_ADDR(mem_addr);\
-} while (0)
+DWORD bf_compile(struct bf_compiler_opts opts, LPBYTE program, DWORD program_max_size, LPDWORD program_len, LPSTR source, DWORD source_len) {
+	UINT32 loop_stack[0x10000] = { 0 };
+	UINT16 loop_offset = 0;
 
-// inc dl
-#define INC_DL() do {\
-	WRITE(0xfe);\
-	WRITE(0xc2);\
-} while (0)
+	bf_write(program, program_max_size, program_len, BFx86_push_ebp, BF_NONE, NULL); // push ebp
+	bf_write(program, program_max_size, program_len, BFx86_mov_ebp_esp, BF_NONE, NULL); // mov ebp, esp
+	bf_write(program, program_max_size, program_len, BFx86_push_ecx, BF_NONE, NULL);
 
-// dec dl
-#define DEC_DL() do {\
-	WRITE(0xfe);\
-	WRITE(0xca);\
-} while (0)
+	DWORD i = 0;
 
-// add dl, n
-#define ADD_DL(n) do {\
-	WRITE(0x80);\
-	WRITE(0xc2);\
-	\
-	WRITE((n) & 0xff);\
-} while (0)
-
-// sub dl, n
-#define SUB_DL(n) do {\
-	WRITE(0x80);\
-	WRITE(0xea);\
-	\
-	WRITE((n) & 0xff);\
-} while (0)
-
-// mov BYTE PTR [ecx+mem_addr], dl
-#define MOV_BYTEPTRECXMEMADDR_DL() do {\
-	WRITE(0x88);\
-	WRITE(0x91);\
-	\
-	WRITE_ADDR(mem_addr);\
-} while (0)
-
-// movsx eax, BYTE PTR [ecx+mem_addr]
-#define MOVSX_EAX_BYTEPTRECXMEMADDR() do {\
-	WRITE(0x0f);\
-	WRITE(0xbe);\
-	WRITE(0x81);\
-	\
-	WRITE_ADDR(mem_addr);\
-} while (0)
-
-// movzx eax, BYTE PTR [ecx+mem_addr]
-#define MOVZX_EAX_BYTEPTRECXMEMADDR() do {\
-	WRITE(0x0f);\
-	WRITE(0xb6);\
-	WRITE(0x81);\
-	\
-	WRITE_ADDR(mem_addr);\
-} while (0)
-
-// call getchar
-#define CALL_GETCHAR() do {\
-	WRITE(0xe8);\
-	\
-	WRITE_ADDR(-((uint32_t)buffer - getchar_addr + 4));\
-} while (0)
-
-// mov BYTE PTR [ecx+mem_addr], al
-#define MOV_BYTEPTRECXMEMADDR_AL() do {\
-	WRITE(0x88);\
-	WRITE(0x81);\
-	\
-	WRITE_ADDR(mem_addr);\
-} while (0)
-
-// push eax
-#define PUSH_EAX() do {\
-	WRITE(0x50);\
-} while (0)
-
-// call putchar
-#define CALL_PUTCHAR() do {\
-	WRITE(0xe8);\
-	\
-	WRITE_ADDR(-((uint32_t)buffer - putchar_addr + 4));\
-} while (0)
-
-// add esp, 4
-#define ADD_ESP_4() do {\
-	WRITE(0x83);\
-	WRITE(0xc4);\
-	WRITE(0x04);\
-} while (0)
-
-#define TEST_EAX_EAX() do {\
-	WRITE(0x85);\
-	WRITE(0xc0);\
-} while (0)
-
-// push ebp
-#define PUSH_EBP() do {\
-	WRITE(0x55);\
-} while (0)
-
-// mov ebp, esp
-#define MOV_EBP_ESP() do {\
-	WRITE(0x8b);\
-	WRITE(0xec);\
-} while (0)
-
-// push ecx
-#define PUSH_ECX() do {\
-	WRITE(0x51);\
-} while (0)
-
-// xor ebx, ebx
-#define XOR_EBX_EBX() do {\
-	WRITE(0x33);\
-	WRITE(0xdb);\
-} while (0)
-
-// xor eax, eax
-#define XOR_EAX_EAX() do {\
-	WRITE(0x33);\
-	WRITE(0xc0);\
-} while (0)
-
-// mov esp, ebp
-#define MOV_ESP_EBP() do {\
-	WRITE(0x8b);\
-	WRITE(0xe5);\
-} while (0)
-
-// pop ebp
-#define POP_EBP() do {\
-	WRITE(0x5d);\
-} while (0)
-
-// ret
-#define RET() do {\
-	WRITE(0xc3);\
-} while (0)
-
-uint32_t bf_compile(uint8_t * buffer, uint32_t max_length, char code[], struct bf_compiler opts) {
-	uint32_t buffer_start = (uint32_t)buffer;
-
-	uint32_t offset_addr = opts.offset_addr;
-	uint32_t mem_addr = opts.mem_addr;
-	uint32_t putchar_addr = opts.putchar_addr;
-	uint32_t getchar_addr = opts.getchar_addr;
-
-	uint32_t loop_stack[65536] = { 0 };
-	uint16_t loop_offset = 0;
-
-	uint32_t length = 0;
-	uint32_t i = 0;
-
-	PUSH_EBP();
-	MOV_EBP_ESP();
-	PUSH_ECX();
-
-	while (i < strlen(code)) {
-		if (code[i] == '>' || code[i] == '<') {
+	while (i < source_len) {
+		if (source[i] == '>' || source[i] == '<') {
 			if (opts.optimization == TRUE) {
-				// Optimise pointer operations
-				int ctr = 0;
+				// Optimise pointer arithmetic
+				INT32 ctr = 0;
 
-				while (code[i] == '>' || code[i] == '<') {
-					if (code[i] == '>') {
+				while (source[i] == '>' || source[i] == '<') {
+					if (source[i] == '>') {
 						++ctr;
-					}
-					else if (code[i] == '<') {
+					} else if (source[i] == '<') {
 						--ctr;
 					}
 
@@ -271,48 +157,41 @@ uint32_t bf_compile(uint8_t * buffer, uint32_t max_length, char code[], struct b
 
 				--i;
 
-				// Only write instructions if there is a change
 				if (ctr != 0) {
-					MOV_AX_DSOFFSETADDR();
+					bf_write(program, program_max_size, program_len, BFx86_mov_ax_dsParam, BF_ADDR, (LPVOID)opts.offset_addr); // mov ax, ds:offset_addr
 
 					if (ctr == 1) {
-						INC_AX();
-					}
-					else if (ctr == -1) {
-						DEC_AX();
-					}
-					else if (ctr > 0) {
-						ADD_AX(ctr);
-					}
-					else if (ctr < 0) {
-						SUB_AX(-ctr);
+						bf_write(program, program_max_size, program_len, BFx86_inc_ax, BF_NONE, NULL); // inc ax
+					} else if (ctr == -1) {
+						bf_write(program, program_max_size, program_len, BFx86_dec_ax, BF_NONE, NULL); // dec ax
+					} else if (ctr > 0) {
+						bf_write(program, program_max_size, program_len, BFx86_add_ax_param, BF_UINT16, (LPVOID)ctr); // add ax, ctr
+					} else if (ctr < 0) {
+						bf_write(program, program_max_size, program_len, BFx86_sub_ax_param, BF_UINT16, (LPVOID)(-ctr)); // sub ax, ctr
 					}
 
-					MOV_DSOFFSETADDR_AX();
+					bf_write(program, program_max_size, program_len, BFx86_mov_dsParam_ax, BF_ADDR, (LPVOID)opts.offset_addr); // mov ds:offset_addr, ax
 				}
+			} else {
+				bf_write(program, program_max_size, program_len, BFx86_mov_ax_dsParam, BF_ADDR, (LPVOID)opts.offset_addr); // mov ax, ds:offset_addr
+
+				if (source[i] == '>') {
+					bf_write(program, program_max_size, program_len, BFx86_inc_ax, BF_NONE, NULL); // inc ax
+				} else if (source[i] == '<') {
+					bf_write(program, program_max_size, program_len, BFx86_dec_ax, BF_NONE, NULL); // dec ax
+				}
+
+				bf_write(program, program_max_size, program_len, BFx86_mov_dsParam_ax, BF_ADDR, (LPVOID)opts.offset_addr); // mov ds:offset_addr, ax
 			}
-			else {
-				MOV_AX_DSOFFSETADDR();
-
-				if (code[i] == '>') {
-					INC_AX();
-				}
-				else if (code[i] == '<') {
-					DEC_AX();
-				}
-
-				MOV_DSOFFSETADDR_AX();
-			}
-		} else if (code[i] == '+' || code[i] == '-') {
+		} else if (source[i] == '+' || source[i] == '-') {
 			if (opts.optimization == TRUE) {
-				// Optimise data operations
-				int ctr = 0;
+				// Optimise data arithmetic
+				INT32 ctr = 0;
 
-				while (code[i] == '+' || code[i] == '-') {
-					if (code[i] == '+') {
+				while (source[i] == '+' || source[i] == '-') {
+					if (source[i] == '+') {
 						++ctr;
-					}
-					else if (code[i] == '-') {
+					} else if (source[i] == '-') {
 						--ctr;
 					}
 
@@ -321,189 +200,247 @@ uint32_t bf_compile(uint8_t * buffer, uint32_t max_length, char code[], struct b
 
 				--i;
 
-				// Only write instructions if there is a change
 				if (ctr != 0) {
-					MOVZX_ECX_WORDPTRDSOFFSETADDR();
-					MOV_DL_BYTEPTRECXMEMADDR();
+					bf_write(program, program_max_size, program_len, BFx86_movzx_ecx_wordPtrDsParam, BF_ADDR, (LPVOID)opts.offset_addr); // movzx ecx, WORD PTR ds:offset_addr
+					bf_write(program, program_max_size, program_len, BFx86_mov_dl_bytePtrEcxParam, BF_ADDR, (LPVOID)opts.mem_addr); // mov dl, BYTE PTR [ecx + param]
 
 					if (ctr == 1) {
-						INC_DL();
-					}
-					else if (ctr == -1) {
-						DEC_DL();
-					}
-					else if (ctr > 0) {
-						ADD_DL(ctr);
-					}
-					else if (ctr < 0) {
-						SUB_DL(-ctr);
+						bf_write(program, program_max_size, program_len, BFx86_inc_dl, BF_NONE, NULL);
+					} else if (ctr == -1) {
+						bf_write(program, program_max_size, program_len, BFx86_dec_dl, BF_NONE, NULL);
+					} else if (ctr > 0) {
+						bf_write(program, program_max_size, program_len, BFx86_add_dl_param, BF_UINT8, (LPVOID)ctr);
+					} else if (ctr < 0) {
+						bf_write(program, program_max_size, program_len, BFx86_sub_dl_param, BF_UINT8, (LPVOID)(-ctr));
 					}
 
-					MOVZX_ECX_WORDPTRDSOFFSETADDR();
-					MOV_BYTEPTRECXMEMADDR_DL();
+					bf_write(program, program_max_size, program_len, BFx86_movzx_ecx_wordPtrDsParam, BF_ADDR, (LPVOID)opts.offset_addr); // movzx ecx, WORD PTR ds:offset_addr
+					bf_write(program, program_max_size, program_len, BFx86_mov_bytePtrEcxParam_dl, BF_ADDR, (LPVOID)opts.mem_addr); // mov BYTE PTR [ecx + param], dl
 				}
-			}
-			else {
-				MOVZX_ECX_WORDPTRDSOFFSETADDR();
-				MOV_DL_BYTEPTRECXMEMADDR();
+			} else {
+				bf_write(program, program_max_size, program_len, BFx86_movzx_ecx_wordPtrDsParam, BF_ADDR, (LPVOID)opts.offset_addr); // movzx ecx, WORD PTR ds:offset_addr
+				bf_write(program, program_max_size, program_len, BFx86_mov_dl_bytePtrEcxParam, BF_ADDR, (LPVOID)opts.mem_addr); // mov dl, BYTE PTR [ecx + param]
 
-				if (code[i] == '+') {
-					INC_DL();
-				}
-				else if (code[i] == '-') {
-					DEC_DL();
+				if (source[i] == '+') {
+					bf_write(program, program_max_size, program_len, BFx86_inc_dl, BF_NONE, NULL);
+				} else if (source[i] == '-') {
+					bf_write(program, program_max_size, program_len, BFx86_dec_dl, BF_NONE, NULL);
 				}
 
-				MOVZX_ECX_WORDPTRDSOFFSETADDR();
-				MOV_BYTEPTRECXMEMADDR_DL();
+				bf_write(program, program_max_size, program_len, BFx86_movzx_ecx_wordPtrDsParam, BF_ADDR, (LPVOID)opts.offset_addr); // movzx ecx, WORD PTR ds:offset_addr
+				bf_write(program, program_max_size, program_len, BFx86_mov_bytePtrEcxParam_dl, BF_ADDR, (LPVOID)opts.mem_addr); // mov BYTE PTR [ecx + param], dl
 			}
-		} else if (code[i] == '.') {
-			MOVZX_ECX_WORDPTRDSOFFSETADDR();
-			MOVSX_EAX_BYTEPTRECXMEMADDR();
-			PUSH_EAX();
-			CALL_PUTCHAR();
-			ADD_ESP_4();
-		} else if (code[i] == ',') {
-			CALL_GETCHAR();
-			MOVZX_ECX_WORDPTRDSOFFSETADDR();
-			MOV_BYTEPTRECXMEMADDR_AL();
-		} else if (code[i] == '[') {
-			// loop_start:
-			loop_stack[loop_offset++] = (uint32_t)buffer;
+		} else if (source[i] == '.') {
+			bf_write(program, program_max_size, program_len, BFx86_movzx_ecx_wordPtrDsParam, BF_ADDR, (LPVOID)opts.offset_addr); // movzx ecx, WORD PTR ds:offset_addr
+			bf_write(program, program_max_size, program_len, BFx86_movsx_eax_bytePtrEcxParam, BF_ADDR, (LPVOID)opts.mem_addr); // movsx eax, BYTE PTR [ecx + param]
+			bf_write(program, program_max_size, program_len, BFx86_push_eax, BF_NONE, NULL); // push eax
+			bf_write(program, program_max_size, program_len, BFx86_call, BF_ADDR_REL, (LPVOID)opts.putchar_addr); // call putchar
+			bf_write(program, program_max_size, program_len, BFx86_add_esp_4, BF_NONE, NULL); // add esp, 4
+		} else if (source[i] == ',') {
+			bf_write(program, program_max_size, program_len, BFx86_call, BF_ADDR_REL, (LPVOID)opts.getchar_addr); // call getchar
+			bf_write(program, program_max_size, program_len, BFx86_movzx_ecx_wordPtrDsParam, BF_ADDR, (LPVOID)opts.offset_addr); // movzx ecx, WORD PTR ds:offset_addr
+			bf_write(program, program_max_size, program_len, BFx86_mov_bytePtrEcxParam_al, BF_ADDR, (LPVOID)opts.mem_addr); // mov BYTE PTR [ecx + param], al
+		} else if (source[i] == '[') {
+			loop_stack[loop_offset++] = (UINT32)(program + *program_len); // loop_start:
 
-			MOVZX_ECX_WORDPTRDSOFFSETADDR();
-			MOVZX_EAX_BYTEPTRECXMEMADDR();
-			TEST_EAX_EAX();
+			bf_write(program, program_max_size, program_len, BFx86_movzx_ecx_wordPtrDsParam, BF_ADDR, (LPVOID)opts.offset_addr); // movzx ecx, WORD PTR ds:offset_addr
+			bf_write(program, program_max_size, program_len, BFx86_movzx_eax_bytePtrEcxParam, BF_ADDR, (LPVOID)opts.mem_addr); // movzx eax, BYTE PTR [ecx + param]
+			bf_write(program, program_max_size, program_len, BFx86_test_eax_eax, BF_NONE, NULL); // test eax, eax
 
-			// je loop_end
-			WRITE(0x0f);
-			WRITE(0x84);
+			bf_write(program, program_max_size, program_len, BFx86_je, BF_ADDR, (LPVOID)0xdeadbeef); // je loop_end
 
-			loop_stack[loop_offset++] = (uint32_t)buffer;
-
-			WRITE_ADDR(0x12345678);
-		} else if (code[i] == ']') {
-			if (loop_offset == 0) {
-				fprintf(stderr, "Unmatched ending ]\n");
-				exit(EXIT_FAILURE);
+			loop_stack[loop_offset++] = (UINT32)(program + *program_len - 4); // Store address to write address of loop end
+		} else if (source[i] == ']') {
+			if (loop_offset < 2) {
+				return ERROR_STACK_OVERFLOW_READ;
 			}
 
-			uint8_t * write_end_addr_at = (uint8_t *)(loop_stack[--loop_offset]);
-			uint32_t start_addr = loop_stack[--loop_offset];
-			
-			// jmp loop_start
-			WRITE(0xe9);
+			LPBYTE write_end_addr_at = (LPBYTE)(loop_stack[--loop_offset]);
+			UINT32 start_addr = loop_stack[--loop_offset];
 
-			uint32_t start_addr_rel = -((int32_t)buffer - (int32_t)start_addr) - 4;
+			bf_write(program, program_max_size, program_len, BFx86_jmp, BF_ADDR_REL, (LPVOID)start_addr);
 
-			WRITE_ADDR(start_addr_rel);
+			UINT32 end_addr_rel = (UINT32)(program + *program_len) - (UINT32)write_end_addr_at - 4;
 
-			uint32_t end_addr_rel = (uint32_t)buffer - (uint32_t)write_end_addr_at - 4;
-
-			if (buffer != NULL) {
-				*(write_end_addr_at + 0) = (end_addr_rel) & 0xff;
-				*(write_end_addr_at + 1) = (end_addr_rel >> 8) & 0xff;
-				*(write_end_addr_at + 2) = (end_addr_rel >> 16) & 0xff;
-				*(write_end_addr_at + 3) = (end_addr_rel >> 24) & 0xff;
+			if (program != NULL) {
+				*(write_end_addr_at++) = (UINT8)(end_addr_rel & 0xff);
+				*(write_end_addr_at++) = (UINT8)((end_addr_rel >>  8) & 0xff);
+				*(write_end_addr_at++) = (UINT8)((end_addr_rel >> 16) & 0xff);
+				*(write_end_addr_at++) = (UINT8)((end_addr_rel >> 24) & 0xff);
 			}
 		}
 
-		i++;
+		++i;
 	}
 
 	if (loop_offset != 0) {
-		fprintf(stderr, "Unmatched starting [\n");
-		exit(EXIT_FAILURE);
+		return ERROR_STACK_OVERFLOW;
 	}
 
-	XOR_EAX_EAX();
-	MOV_ESP_EBP();
-	POP_EBP();
-	RET();
+	bf_write(program, program_max_size, program_len, BFx86_xor_eax_eax, BF_NONE, NULL); // xor eax, eax
+	bf_write(program, program_max_size, program_len, BFx86_mov_esp_ebp, BF_NONE, NULL); // mov esp, ebp
+	bf_write(program, program_max_size, program_len, BFx86_pop_ebp, BF_NONE, NULL); // pop ebp
+	bf_write(program, program_max_size, program_len, BFx86_ret, BF_NONE, NULL); // ret
 
-	++length;
-
-	return length;
+	return NO_ERROR;
 }
 
-DWORD g_BytesTransferred = 0;
+DWORD bf_readfile(LPSTR filename, LPSTR * buffer, LPDWORD buffer_len) {
+	DWORD buffer_alloc_len = 0;
 
-VOID CALLBACK FileIoCompletionRoutine(__in DWORD dwErrorCode, __in DWORD dwNumberOfBytesTransferred, __in LPOVERLAPPED lpOverlapped) {
-	g_BytesTransferred = dwNumberOfBytesTransferred;
+	HANDLE file = CreateFile(filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+	if (file == INVALID_HANDLE_VALUE) {
+		return GetLastError();
+	}
+
+	BOOL keep_going = TRUE;
+	CHAR tmp_buffer[CHUNK_SIZE];
+
+	while (keep_going) {
+		DWORD bytes_read = 0;
+
+		BOOL result = ReadFile(file, tmp_buffer, CHUNK_SIZE, &bytes_read, NULL);
+
+		if (bytes_read == 0) {
+			keep_going = FALSE;
+
+			CloseHandle(file);
+		}
+
+		if (!result) {
+			DWORD err = GetLastError();
+
+			if (err == ERROR_HANDLE_EOF) {
+				keep_going = FALSE;
+
+				CloseHandle(file);
+			} else {
+				CloseHandle(file);
+
+				return err;
+			}
+		}
+
+		for (DWORD i = 0; i < bytes_read; i++) {
+			if (strchr("><+-[],.", tmp_buffer[i]) != NULL) {
+				if (*buffer_len >= buffer_alloc_len) {
+					LPSTR new_buffer = (LPSTR)realloc(*buffer, buffer_alloc_len + CHUNK_SIZE);
+
+					if (new_buffer == NULL) {
+						CloseHandle(file);
+
+						free(*buffer);
+
+						*buffer = NULL;
+						*buffer_len = 0;
+
+						buffer_alloc_len = 0;
+
+						return ERROR_OUTOFMEMORY;
+					}
+
+					*buffer = new_buffer;
+
+					buffer_alloc_len += CHUNK_SIZE;
+				}
+
+				(*buffer)[(*buffer_len)++] = tmp_buffer[i];
+			}
+		}
+	}
+
+	return NO_ERROR;
 }
-
-typedef void(*voidFn)();
 
 int main(int argc, char * argv[]) {
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s <file_name>\n", argv[0]);
 		return EXIT_FAILURE;
 	}
-
-	char * filename = argv[1];
-
-	HANDLE hFile = CreateFile(filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
-
-	if (hFile == INVALID_HANDLE_VALUE) {
-		fprintf(stderr, "Unable to open file \"%s\" for reading.\n GetLastError=%#010x\n", filename, GetLastError());
-	}
-
-	LARGE_INTEGER fileSize;
-
-	if (GetFileSizeEx(hFile, &fileSize) == FALSE) {
-		fprintf(stderr, "Unable to determine size of file.\n GetLastError=%#010x\n", GetLastError());
-		CloseHandle(hFile);
-
-		return EXIT_FAILURE;
-	}
-
-	char * code = (char *)malloc(fileSize.LowPart + 1);
-	OVERLAPPED ol = { 0 };
-
-	if (ReadFileEx(hFile, code, fileSize.LowPart, &ol, FileIoCompletionRoutine) == FALSE) {
-		fprintf(stderr, "Unable to read file.\n GetLastError=%#010x\n", GetLastError());
-		CloseHandle(hFile);
-
-		return EXIT_FAILURE;
-	}
-
-	CloseHandle(hFile);
-
-	code[g_BytesTransferred - 1] = '0';
 	
-	struct bf_compiler compiler;
+	// Read bf file
+	LPSTR filename = argv[1];
 
-	uint8_t mem[65536] = { 0 };
-	uint16_t offset = 0;
+	//halt();
 
-	compiler.offset_addr = (uint32_t)&offset;
-	compiler.mem_addr = (uint32_t)mem;
-	compiler.putchar_addr = (uint32_t)&putchar;
-	compiler.getchar_addr = (uint32_t)&getchar;
-	compiler.optimization = TRUE;
+	LPSTR source = NULL;
+	DWORD source_len = 0;
 
-	// Establish code length
+	DWORD err = bf_readfile(filename, &source, &source_len);
 
-	uint32_t code_length = bf_compile(NULL, 0, code, compiler);
-	//uint32_t code_length = 0x6400000;
+	if (err != NO_ERROR) {
+		LPSTR err_msg;
 
-	uint8_t * program = VirtualAlloc(NULL, code_length, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+		FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPTSTR)&err_msg, 0, NULL);
 
-	bf_compile(program, code_length, code, compiler);
-	free(code);
+		fprintf(stderr, err_msg);
 
-	// Make program executable and run
-	DWORD oldProtection;
+		return err;
+	}
 
-	VirtualProtect(program, code_length, PAGE_EXECUTE_READ, &oldProtection);
+	// Set up compiler
+	struct bf_compiler_opts opts;
 
-	voidFn progex = (voidFn)program;
+	UINT8 bf_program_memory[0x10000] = { 0 };
+	UINT16 bf_program_offset = 0;
 
-	progex();
+	opts.mem_addr = (UINT32)bf_program_memory;
+	opts.offset_addr = (UINT32)&bf_program_offset;
+
+	opts.putchar_addr = (UINT32)&putchar;
+	opts.getchar_addr = (UINT32)&getchar;
+
+	opts.optimization = TRUE;
+	
+	// Allocate memory for program (64 MB max)
+	DWORD program_max_size = 0x4000000;
+	DWORD program_len = 0;
+	LPBYTE program = VirtualAlloc(NULL, program_max_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+	// Compile
+	err = bf_compile(opts, program, program_max_size, &program_len, source, source_len);
+
+	// Clean up source code
+	free(source);
+
+	source = NULL;
+	source_len = 0;
+
+	if (err != NO_ERROR) {
+		VirtualFree(program, 0, MEM_RELEASE);
+
+		LPSTR err_msg;
+
+		FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPTSTR)&err_msg, 0, NULL);
+
+		fprintf(stderr, err_msg);
+
+		return err;
+	}
+
+	/*
+	// Print program
+	printf("\n");
+
+	for (DWORD i = 0; i < program_len; i++) {
+		printf("%02x ", program[i]);
+	}
+
+	printf("\n\n");
+	*/
+
+	// Make program executable
+	DWORD old_protection;
+
+	VirtualProtect(program, program_max_size, PAGE_EXECUTE_READ, &old_protection);
+
+	bf_void_program program_fn = (bf_void_program)program;
+
+	program_fn();
 
 	// Cleanup
-	VirtualProtect(program, code_length, oldProtection, &oldProtection);
-
+	VirtualProtect(program, program_max_size, old_protection, &old_protection);
 	VirtualFree(program, 0, MEM_RELEASE);
 
 	return EXIT_SUCCESS;
